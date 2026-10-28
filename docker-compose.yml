@@ -16,6 +16,17 @@ services:
   metadata:
     build: ./metadata
     ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql://storage:storage@postgres:5432/storage
+    depends_on: [postgres]
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: storage
+      POSTGRES_PASSWORD: storage
+      POSTGRES_DB: storage
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
 
   node-1:
     build: ./storage_node
@@ -50,3 +61,4 @@ volumes:
   storage-node-2: { external: true }
   storage-node-3: { external: true }
   storage-node-4: { external: true }
+  postgres-data: {}
