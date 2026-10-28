@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     fragments JSONB NOT NULL,
     PRIMARY KEY (hash, scheme)
 );
+ALTER TABLE objects ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '{}'::jsonb;
 """
 
 

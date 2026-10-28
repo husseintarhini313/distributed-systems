@@ -1,18 +1,21 @@
 import hashlib
 import os
+import re
 import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 import db
 import redundancy as rd
-from chunking import cdc_chunks, fixed_chunks
+from chunking import StreamSplitter
 from ring import HashRing
 from state import HEARTBEAT_TIMEOUT, alive_nodes, failed_nodes, nodes
 
@@ -21,6 +24,8 @@ CDC_MIN_SIZE = int(os.getenv("CDC_MIN_SIZE", 1 * 1024 * 1024))
 CDC_AVG_SIZE = int(os.getenv("CDC_AVG_SIZE", 4 * 1024 * 1024))
 CDC_MAX_SIZE = int(os.getenv("CDC_MAX_SIZE", 8 * 1024 * 1024))
 VNODES = int(os.getenv("VNODES", "100"))
+RANGE_PATTERN = re.compile(r"bytes=(\d*)-(\d*)")
+OBJECT_FIELDS = ("bucket", "key", "version", "size", "chunking", "redundancy", "tags", "created_at")
 
 
 @asynccontextmanager
@@ -41,12 +46,14 @@ class Heartbeat(BaseModel):
     chunk_count: int
 
 
-def split(data, method):
-    if method == "fixed":
-        return fixed_chunks(data, FIXED_CHUNK_SIZE)
-    if method == "cdc":
-        return cdc_chunks(data, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE)
-    raise HTTPException(400, "chunking must be 'fixed' or 'cdc'")
+def parse_tags(raw):
+    tags = {}
+    for item in filter(None, raw.split(",")):
+        if "=" not in item:
+            raise HTTPException(400, "tags must look like key=value,key2=value2")
+        name, value = item.split("=", 1)
+        tags[name.strip()] = value.strip()
+    return tags
 
 
 @app.post("/heartbeat")
@@ -91,72 +98,89 @@ def list_buckets():
     return [{"bucket": n, "redundancy": r, "created_at": c} for n, r, c in rows]
 
 
-def store_object(bucket, key, data, method):
-    with db.connect() as conn:
-        row = conn.execute("SELECT redundancy FROM buckets WHERE name = %s", (bucket,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Bucket not found")
-        scheme = row[0]
-        if not alive_nodes():
-            raise HTTPException(503, "No storage nodes available")
+def bucket_scheme(conn, bucket):
+    row = conn.execute("SELECT redundancy FROM buckets WHERE name = %s", (bucket,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Bucket not found")
+    if not alive_nodes():
+        raise HTTPException(503, "No storage nodes available")
+    return row[0]
 
-        start = time.time()
-        pieces = split(data, method)
-        chunking_seconds = round(time.time() - start, 2)
 
-        hashes = []
-        new_chunks = 0
-        deduplicated = 0
-        for piece in pieces:
-            chunk_hash = hashlib.sha256(piece).hexdigest()
-            hashes.append(chunk_hash)
-            existing = conn.execute(
-                "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = %s AND scheme = %s RETURNING hash",
-                (chunk_hash, scheme),
-            ).fetchone()
-            if existing:
-                deduplicated += 1
-                continue
-            fragments = rd.write_chunk(piece, chunk_hash, scheme)
-            conn.execute(
-                "INSERT INTO chunks (hash, scheme, size, ref_count, fragments) VALUES (%s, %s, %s, 1, %s)",
-                (chunk_hash, scheme, len(piece), Jsonb(fragments)),
-            )
-            new_chunks += 1
+def save_chunk(conn, piece, scheme, result):
+    chunk_hash = hashlib.sha256(piece).hexdigest()
+    result["hashes"].append(chunk_hash)
+    result["size"] += len(piece)
+    existing = conn.execute(
+        "UPDATE chunks SET ref_count = ref_count + 1 WHERE hash = %s AND scheme = %s RETURNING hash",
+        (chunk_hash, scheme),
+    ).fetchone()
+    if existing:
+        result["deduplicated"] += 1
+        return
+    fragments = rd.write_chunk(piece, chunk_hash, scheme)
+    conn.execute(
+        "INSERT INTO chunks (hash, scheme, size, ref_count, fragments) VALUES (%s, %s, %s, 1, %s)",
+        (chunk_hash, scheme, len(piece), Jsonb(fragments)),
+    )
+    result["new"] += 1
 
-        version = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM objects WHERE bucket = %s AND key = %s",
-            (bucket, key),
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT INTO objects (bucket, key, version, size, chunking, redundancy, chunk_hashes) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (bucket, key, version, len(data), method, scheme, hashes),
-        )
+
+def finish_object(conn, bucket, key, method, scheme, tags, result):
+    version = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM objects WHERE bucket = %s AND key = %s",
+        (bucket, key),
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO objects (bucket, key, version, size, chunking, redundancy, chunk_hashes, tags) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (bucket, key, version, result["size"], method, scheme, result["hashes"], Jsonb(tags)),
+    )
+    conn.commit()
+    return version
+
+
+@app.put("/objects/{bucket}/{key}", status_code=201)
+async def upload_object(bucket: str, key: str, request: Request, chunking: str = "fixed", tags: str = ""):
+    if chunking not in ("fixed", "cdc"):
+        raise HTTPException(400, "chunking must be 'fixed' or 'cdc'")
+    tag_map = parse_tags(tags)
+    splitter = StreamSplitter(chunking, FIXED_CHUNK_SIZE, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE)
+    result = {"hashes": [], "size": 0, "new": 0, "deduplicated": 0}
+    start = time.time()
+    conn = await run_in_threadpool(db.connect)
+    try:
+        scheme = await run_in_threadpool(bucket_scheme, conn, bucket)
+        async for part in request.stream():
+            for piece in await run_in_threadpool(splitter.feed, part):
+                await run_in_threadpool(save_chunk, conn, piece, scheme, result)
+        for piece in await run_in_threadpool(splitter.finish):
+            await run_in_threadpool(save_chunk, conn, piece, scheme, result)
+        version = await run_in_threadpool(finish_object, conn, bucket, key, chunking, scheme, tag_map, result)
+    except Exception:
+        await run_in_threadpool(conn.rollback)
+        raise
+    finally:
+        await run_in_threadpool(conn.close)
 
     return {
         "bucket": bucket,
         "key": key,
         "version": version,
-        "size": len(data),
-        "chunking": method,
+        "size": result["size"],
+        "chunking": chunking,
         "redundancy": scheme,
-        "chunking_seconds": chunking_seconds,
-        "total_chunks": len(hashes),
-        "new_chunks": new_chunks,
-        "deduplicated_chunks": deduplicated,
+        "tags": tag_map,
+        "upload_seconds": round(time.time() - start, 2),
+        "total_chunks": len(result["hashes"]),
+        "new_chunks": result["new"],
+        "deduplicated_chunks": result["deduplicated"],
     }
-
-
-@app.put("/objects/{bucket}/{key}", status_code=201)
-async def upload_object(bucket: str, key: str, request: Request, chunking: str = "fixed"):
-    data = await request.body()
-    return await run_in_threadpool(store_object, bucket, key, data, chunking)
 
 
 def latest_version(conn, bucket, key):
     row = conn.execute(
-        "SELECT version, size, chunking, redundancy, chunk_hashes, created_at FROM objects "
+        "SELECT version, size, chunking, redundancy, chunk_hashes, created_at, tags FROM objects "
         "WHERE bucket = %s AND key = %s ORDER BY version DESC LIMIT 1",
         (bucket, key),
     ).fetchone()
@@ -168,7 +192,7 @@ def latest_version(conn, bucket, key):
 @app.get("/objects/{bucket}/{key}/metadata")
 def object_metadata(bucket: str, key: str):
     with db.connect() as conn:
-        version, size, method, scheme, hashes, created_at = latest_version(conn, bucket, key)
+        version, size, method, scheme, hashes, created_at, tags = latest_version(conn, bucket, key)
     return {
         "bucket": bucket,
         "key": key,
@@ -176,23 +200,59 @@ def object_metadata(bucket: str, key: str):
         "size": size,
         "chunking": method,
         "redundancy": scheme,
+        "tags": tags,
         "chunk_hashes": hashes,
         "created_at": created_at,
     }
 
 
+def parse_range(header, total):
+    match = RANGE_PATTERN.fullmatch(header.strip())
+    unsatisfiable = HTTPException(416, "Range not satisfiable", headers={"Content-Range": f"bytes */{total}"})
+    if not match or match.group(1) == match.group(2) == "":
+        raise unsatisfiable
+    first, last = match.groups()
+    if first == "":
+        start = max(total - int(last), 0)
+        end = total - 1
+    else:
+        start = int(first)
+        end = min(int(last), total - 1) if last else total - 1
+    if start > end or start >= total:
+        raise unsatisfiable
+    return start, end
+
+
 @app.get("/objects/{bucket}/{key}")
-def download_object(bucket: str, key: str):
+def download_object(bucket: str, key: str, byte_range: str | None = Header(default=None, alias="range")):
     with db.connect() as conn:
-        _, _, _, scheme, hashes, _ = latest_version(conn, bucket, key)
-        parts = []
+        _, size, _, scheme, hashes, _, _ = latest_version(conn, bucket, key)
+        chunks = []
         for chunk_hash in hashes:
-            size, fragments = conn.execute(
+            chunk_size, fragments = conn.execute(
                 "SELECT size, fragments FROM chunks WHERE hash = %s AND scheme = %s",
                 (chunk_hash, scheme),
             ).fetchone()
-            parts.append(rd.read_chunk(chunk_hash, scheme, size, fragments))
-    return Response(content=b"".join(parts), media_type="application/octet-stream")
+            chunks.append((chunk_hash, chunk_size, fragments))
+
+    start, end = parse_range(byte_range, size) if byte_range else (0, size - 1)
+
+    def generate():
+        offset = 0
+        for chunk_hash, chunk_size, fragments in chunks:
+            chunk_start = offset
+            offset += chunk_size
+            if offset <= start or chunk_start > end:
+                continue
+            data = rd.read_chunk(chunk_hash, scheme, chunk_size, fragments)
+            yield data[max(start - chunk_start, 0):end - chunk_start + 1]
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(max(end - start + 1, 0))}
+    status = 200
+    if byte_range:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        status = 206
+    return StreamingResponse(generate(), status_code=status, headers=headers, media_type="application/octet-stream")
 
 
 @app.delete("/objects/{bucket}/{key}")
@@ -217,6 +277,105 @@ def delete_object(bucket: str, key: str):
                     conn.execute("DELETE FROM chunks WHERE hash = %s AND scheme = %s", (chunk_hash, scheme))
                     removed += 1
     return {"deleted_versions": len(rows), "chunks_removed": removed}
+
+
+@app.get("/objects")
+def search_objects(
+    bucket: str | None = None,
+    prefix: str | None = None,
+    min_size: int | None = None,
+    max_size: int | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    tag: list[str] = Query(default=[]),
+    limit: int = 100,
+):
+    conditions, params = [], []
+    if bucket:
+        conditions.append("bucket = %s")
+        params.append(bucket)
+    if prefix:
+        conditions.append("key LIKE %s")
+        params.append(prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    if min_size is not None:
+        conditions.append("size >= %s")
+        params.append(min_size)
+    if max_size is not None:
+        conditions.append("size <= %s")
+        params.append(max_size)
+    if created_after:
+        conditions.append("created_at >= %s")
+        params.append(created_after)
+    if created_before:
+        conditions.append("created_at <= %s")
+        params.append(created_before)
+    for item in tag:
+        if "=" not in item:
+            raise HTTPException(400, "tag must look like key=value")
+        name, value = item.split("=", 1)
+        conditions.append("tags @> %s")
+        params.append(Jsonb({name: value}))
+
+    where = " AND ".join(conditions) if conditions else "TRUE"
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT bucket, key, version, size, chunking, redundancy, tags, created_at FROM ("
+            "SELECT DISTINCT ON (bucket, key) * FROM objects ORDER BY bucket, key, version DESC) latest "
+            f"WHERE {where} ORDER BY bucket, key LIMIT %s",
+            (*params, limit),
+        ).fetchall()
+    return [dict(zip(OBJECT_FIELDS, row)) for row in rows]
+
+
+@app.get("/cluster/status")
+def cluster_status():
+    alive = alive_nodes()
+    now = time.time()
+    with db.connect() as conn:
+        per_node = dict(conn.execute(
+            "SELECT f->>'node', COUNT(*) FROM chunks, jsonb_array_elements(fragments) AS f GROUP BY 1"
+        ).fetchall())
+        degraded_chunks = set(conn.execute(
+            "SELECT hash, scheme FROM chunks c WHERE "
+            "EXISTS (SELECT 1 FROM jsonb_array_elements(c.fragments) f WHERE NOT (f->>'node' = ANY(%s::text[]))) "
+            "OR (c.scheme = 'replication' AND jsonb_array_length(c.fragments) < %s) "
+            "OR (c.scheme = 'ec' AND jsonb_array_length(c.fragments) < %s)",
+            (alive, rd.REPLICAS, rd.EC_K + rd.EC_M),
+        ).fetchall())
+        latest = conn.execute(
+            "SELECT DISTINCT ON (bucket, key) bucket, key, redundancy, chunk_hashes, size "
+            "FROM objects ORDER BY bucket, key, version DESC"
+        ).fetchall()
+
+    degraded_objects = [
+        {"bucket": b, "key": k}
+        for b, k, scheme, hashes, _ in latest
+        if any((h, scheme) in degraded_chunks for h in hashes)
+    ]
+    node_list = [
+        {
+            "node_id": node,
+            "alive": node in alive,
+            "failed": node in failed_nodes,
+            "free_space": info["free_space"],
+            "chunks_on_disk": info["chunk_count"],
+            "fragments_assigned": per_node.get(node, 0),
+            "seconds_since_heartbeat": round(now - info["last_seen"], 1),
+        }
+        for node, info in sorted(nodes.items())
+    ]
+    return {
+        "total_nodes": len(nodes),
+        "alive_nodes": len(alive),
+        "free_space_bytes": sum(n["free_space"] for n in node_list if n["alive"]),
+        "objects": len(latest),
+        "logical_bytes": sum(row[4] for row in latest),
+        "degraded_chunks": len(degraded_chunks),
+        "degraded_objects_count": len(degraded_objects),
+        "degraded_objects": degraded_objects[:100],
+        "nodes": node_list,
+        "repair": rd.repair_status,
+    }
 
 
 @app.get("/chunks/stats")

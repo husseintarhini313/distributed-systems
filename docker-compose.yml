@@ -20,6 +20,16 @@ services:
       DATABASE_URL: postgresql://storage:storage@postgres:5432/storage
     depends_on: [postgres]
 
+  gateway:
+    build: ./gateway
+    ports: ["8090:8000"]
+    environment:
+      METADATA_URL: http://metadata:8000
+      API_KEYS: dev-key-123:hussein,limit-test-key:tester
+      RATE_LIMIT: "60"
+      PYTHONUNBUFFERED: "1"
+    depends_on: [metadata]
+
   postgres:
     image: postgres:16
     environment:

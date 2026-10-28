@@ -19,6 +19,7 @@ EC_K = int(os.getenv("EC_K", "4"))
 EC_M = int(os.getenv("EC_M", "2"))
 VNODES = int(os.getenv("VNODES", "100"))
 SCRUB_INTERVAL = int(os.getenv("SCRUB_INTERVAL", "60"))
+REPAIR_DELAY = int(os.getenv("REPAIR_DELAY", "30"))
 
 if WRITE_QUORUM + READ_QUORUM <= REPLICAS:
     raise RuntimeError("Invalid quorum: W + R must be greater than N")
@@ -214,6 +215,9 @@ def repair_node(node):
         repair_status.update(state="finished", finished_at=time.time())
 
 
+failed_since = {}
+
+
 def monitor_loop():
     while True:
         now = time.time()
@@ -221,14 +225,19 @@ def monitor_loop():
             dead = now - info["last_seen"] >= HEARTBEAT_TIMEOUT
             if dead and node not in failed_nodes:
                 failed_nodes.add(node)
-                print(f"[monitor] {node} missed its heartbeats, marked as failed, starting repair")
+                failed_since[node] = now
+                print(f"[monitor] {node} missed its heartbeats, marked as failed, repair in {REPAIR_DELAY}s")
+            elif not dead and node in failed_nodes:
+                failed_nodes.discard(node)
+                failed_since.pop(node, None)
+                print(f"[monitor] {node} is back online")
+            elif dead and node in failed_since and now - failed_since[node] >= REPAIR_DELAY:
+                failed_since.pop(node)
+                print(f"[monitor] starting repair of {node}")
                 try:
                     repair_node(node)
                 except Exception as e:
                     print(f"[monitor] repair of {node} failed: {e}")
-            elif not dead and node in failed_nodes:
-                failed_nodes.discard(node)
-                print(f"[monitor] {node} is back online")
         time.sleep(5)
 
 
