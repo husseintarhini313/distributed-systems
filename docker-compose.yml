@@ -12,3 +12,41 @@ services:
   grafana:
     image: grafana/grafana
     ports: ["3000:3000"]
+
+  metadata:
+    build: ./metadata
+    ports: ["8000:8000"]
+
+  node-1:
+    build: ./storage_node
+    environment: { NODE_ID: node-1 }
+    volumes: ["storage-node-1:/data"]
+    ports: ["8001:8000"]
+    depends_on: [metadata]
+
+  node-2:
+    build: ./storage_node
+    environment: { NODE_ID: node-2 }
+    volumes: ["storage-node-2:/data"]
+    ports: ["8002:8000"]
+    depends_on: [metadata]
+
+  node-3:
+    build: ./storage_node
+    environment: { NODE_ID: node-3 }
+    volumes: ["storage-node-3:/data"]
+    ports: ["8003:8000"]
+    depends_on: [metadata]
+
+  node-4:
+    build: ./storage_node
+    environment: { NODE_ID: node-4 }
+    volumes: ["storage-node-4:/data"]
+    ports: ["8004:8000"]
+    depends_on: [metadata]
+
+volumes:
+  storage-node-1: { external: true }
+  storage-node-2: { external: true }
+  storage-node-3: { external: true }
+  storage-node-4: { external: true }
